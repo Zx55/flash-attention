@@ -30,13 +30,63 @@ _BASE_INPUTS = FwdHeuristicInputs(
 )
 
 
-def make_inputs(**changes) -> FwdHeuristicInputs:
-    return _BASE_INPUTS._replace(**changes)
+def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInputs:
+    return _BASE_INPUTS._replace(pack_gqa=pack_gqa, **changes)
 
 
 @pytest.mark.parametrize("device_arch", [80, 90, 100, 103, 110, 120])
 def test_every_architecture_selects_a_valid_default(device_arch):
     select_fwd_config(make_inputs(device_arch=device_arch))
+
+
+@pytest.mark.parametrize(
+    ("changes", "pack_gqa", "expected"),
+    [
+        ({}, None, False),
+        ({"num_heads_kv": 4}, None, True),
+        ({"num_heads_kv": 4}, False, False),
+        ({}, True, True),
+        ({"device_arch": 90, "num_heads": 24, "num_heads_kv": 8,
+          "head_dim": 128, "head_dim_v": 128}, None, True),
+        ({"num_heads": 24, "num_heads_kv": 8,
+          "head_dim": 256, "head_dim_v": 256}, None, False),
+    ],
+)
+def test_pack_gqa_resolves_before_dependent_policy(changes, pack_gqa, expected):
+    inputs = make_inputs(pack_gqa=pack_gqa, **changes)
+
+    config = select_fwd_config(inputs)
+
+    assert config.pack_gqa is expected
+    assert config == select_fwd_config(inputs._replace(pack_gqa=expected))
+    validate_fwd_config(config, inputs)
+
+
+@pytest.mark.parametrize("pack_gqa", [None, True])
+def test_per_head_sparse_masks_disable_pack_gqa(pack_gqa):
+    inputs = make_inputs(
+        num_heads_kv=4, pack_gqa=pack_gqa, use_block_sparsity=True, sparse_mask_per_head=True
+    )
+
+    config = select_fwd_config(inputs)
+
+    assert not config.pack_gqa
+    assert select_fwd_config(inputs._replace(sparse_mask_per_head=False)).pack_gqa
+    with pytest.raises(ValueError, match="head-broadcast sparse masks"):
+        validate_fwd_config(replace(config, pack_gqa=True), inputs)
+
+
+def test_explicit_config_owns_pack_gqa_when_the_request_is_unspecified():
+    inputs = make_inputs(num_heads=24, num_heads_kv=8, head_dim=128, head_dim_v=128)
+    packed = select_fwd_config(inputs)
+
+    assert packed.pack_gqa
+    assert not packed.use_tma_o
+    assert not packed.use_2cta_instrs
+    unpacked = replace(packed, pack_gqa=False, use_tma_o=True, use_2cta_instrs=True)
+    validate_fwd_config(unpacked, inputs)
+    with pytest.raises(ValueError, match="TMA O"):
+        validate_fwd_config(replace(unpacked, pack_gqa=True), inputs)
 
 
 def test_2cta_boundary_follows_packed_q_tiles():

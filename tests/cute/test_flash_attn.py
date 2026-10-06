@@ -6,7 +6,9 @@ import os
 import random
 import re
 import gc
+from dataclasses import replace
 from functools import wraps
+from unittest import mock
 
 import pytest
 import torch
@@ -19,6 +21,7 @@ except ImportError:
     apply_rotary_emb = None
 
 from flash_attn.cute.cache_utils import JITCache
+from flash_attn.cute.config import FwdConfig, Sm100Registers, select_fwd_config
 from flash_attn.cute.testing import (
     check_dsink_vs_ref,
     check_tensor_vs_ref,
@@ -37,6 +40,7 @@ from flash_attn.cute.interface import (
     _bwd_preprocess,
     _bwd_postprocess_convert,
     _flash_attn_fwd,
+    _flash_attn_fwd_combine,
     _flash_attn_bwd,
 )
 
@@ -103,7 +107,7 @@ def test_flash_attn_sm120_num_splits(num_splits):
     out = flash_attn_func(q, k, v)
     out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
     torch.testing.assert_close(out_auto, out)
-    with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
+    with pytest.raises(ValueError, match="SM120 forward only supports num_splits=1"):
         flash_attn_func(q, k, v, num_splits=3)
 
 
@@ -434,6 +438,156 @@ def test_flash_attn_paged_non_tma_partial_loader_tile():
         v_ref.float().transpose(0, 1).unsqueeze(0),
     ).transpose(1, 2)
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11],
+    reason="SM100/SM110 runtime SplitKV specialization test",
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_forced_split_config_reuses_specializations():
+    """Exact split counts must not enter the compile key."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 8, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2048, 8, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 2048, 8, 64, device="cuda", dtype=torch.bfloat16)
+    capacity = torch.cuda.get_device_capability()[0]
+    config_2 = FwdConfig(
+        device_capacity=capacity,
+        tile_m=128,
+        tile_n=128,
+        mma_pv_is_rs=False,
+        intra_wg_overlap=False,
+        q_stage=1,
+        pack_gqa=False,
+        use_clc_scheduler=False,
+        is_static_persistent=False,
+        use_tma_o=True,
+        use_s_ping_pong=False,
+        num_splits=2,
+        use_2cta_instrs=False,
+        registers=Sm100Registers(softmax=200, correction=64, other=48),
+    )
+    out_2 = _flash_attn_fwd(q, k, v, config=config_2)[0]
+    main_keys = set(_flash_attn_fwd.compile_cache.cache)
+    combine_keys = set(_flash_attn_fwd_combine.compile_cache.cache)
+    out_4 = _flash_attn_fwd(q, k, v, config=replace(config_2, num_splits=4))[0]
+    assert set(_flash_attn_fwd.compile_cache.cache) == main_keys
+    assert set(_flash_attn_fwd_combine.compile_cache.cache) == combine_keys
+    if is_fake_mode():
+        return
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)
+    ).transpose(1, 2)
+
+    torch.testing.assert_close(out_2.float(), reference, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(out_4.float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11],
+    reason="SM100/SM110 explicit config metadata test",
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_explicit_config_rejects_caller_scheduler_metadata():
+    """Caller metadata assumes default scheduling, which explicit configs may override."""
+    lengths = [129, 129]
+    q = torch.randn(sum(lengths), 1, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
+    varlen = dict(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+    )
+    metadata = get_scheduler_metadata(nheads=1, nheads_kv=1, headdim=64, num_splits=1, **varlen)
+    config = FwdConfig(
+        device_capacity=torch.cuda.get_device_capability()[0],
+        tile_m=128,
+        tile_n=128,
+        mma_pv_is_rs=False,
+        intra_wg_overlap=False,
+        q_stage=1,
+        pack_gqa=False,
+        use_clc_scheduler=False,
+        is_static_persistent=False,
+        use_tma_o=False,
+        use_s_ping_pong=False,
+        num_splits=1,
+        use_2cta_instrs=False,
+        registers=Sm100Registers(softmax=200, correction=64, other=48),
+    )
+
+    _flash_attn_fwd(q, k, v, config=config, **varlen)
+    with pytest.raises(ValueError, match="cannot reuse caller-built scheduler_metadata"):
+        _flash_attn_fwd(q, k, v, scheduler_metadata=metadata, config=config, **varlen)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11],
+    reason="SM100/SM110 varlen scheduler metadata test",
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_scheduler_metadata_semaphore_follows_selected_scheduler(monkeypatch):
+    """Varlen MHA metadata needs the tile semaphore even with FA_CLC=1."""
+    from flash_attn.cute import utils as cute_utils
+
+    monkeypatch.setattr(cute_utils, "_fa_clc_enabled", True)
+    cu_seqlens = torch.tensor([0, 300, 500], device="cuda", dtype=torch.int32)
+    metadata = get_scheduler_metadata(
+        nheads=4,
+        nheads_kv=4,
+        headdim=128,
+        num_splits=1,
+        causal=True,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=300,
+        max_seqlen_k=300,
+    )
+    assert metadata.tile_count_semaphore is not None
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11],
+    reason="SM100/SM110 hd256 varlen 2CTA config test",
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_explicit_config_ignores_disabled_scheduler_metadata():
+    """Disabled metadata must not constrain an explicit config."""
+    lengths = [300, 300]
+    q = torch.randn(sum(lengths), 8, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
+    varlen = dict(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+    )
+    selected = {}
+
+    def capture_config(inputs):
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture_config):
+        _flash_attn_fwd(q, k, v, **varlen)
+    # Active caller metadata excludes hd256 varlen 2CTA.
+    assert selected["config"].use_2cta_instrs
+    metadata = get_scheduler_metadata(nheads=8, nheads_kv=8, headdim=256, num_splits=1, **varlen)
+    _flash_attn_fwd(
+        q,
+        k,
+        v,
+        scheduler_metadata=metadata,
+        disable_scheduler_metadata=True,
+        config=selected["config"],
+        **varlen,
+    )
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
