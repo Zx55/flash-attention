@@ -535,6 +535,19 @@ def test_invalid_register_splits_are_rejected():
         validate_fwd_config(
             replace(select_fwd_config(sm80), registers=Sm100Registers(200, 64, 48)), sm80
         )
+
+
+_B200_LONG_PREFILL = make_inputs(
+    num_heads=32,
+    num_heads_kv=32,
+    batch_size=1,
+    total_q=257,
+    total_k=2048,
+    max_seqlen_q=257,
+    max_seqlen_k=2048,
+)
+
+
 def select_untuned(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Select without measured overrides or cached results."""
     with mock.patch.object(
@@ -551,6 +564,7 @@ def tuned_fields(inputs: FwdHeuristicInputs) -> set[str]:
 
 _TUNED_RULES = {
     # rule -> (matching inputs, required field changes)
+    "b200_d64_direct_o": (_B200_LONG_PREFILL, {"use_tma_o"}),
     "sm103_d64_nonpersistent": (
         make_inputs(device_arch=103, max_seqlen_k=8192),
         {"is_static_persistent"},
@@ -627,6 +641,15 @@ def test_tuned_rules_fire_only_for_plain_bf16(rule, changes):
 @pytest.mark.parametrize(
     ("rule", "changes", "fires"),
     [
+        ("b200_d64_direct_o", {"max_seqlen_q": 256}, False),
+        ("b200_d64_direct_o", {"max_seqlen_k": 2047}, False),
+        ("b200_d64_direct_o", {"num_heads": 31, "num_heads_kv": 31}, False),
+        ("b200_d64_direct_o", {"causal": True}, False),
+        ("b200_d64_direct_o", {"num_heads": 64, "num_heads_kv": 16, "pack_gqa": True}, True),
+        ("b200_d64_direct_o", {"num_heads": 64, "num_heads_kv": 32, "pack_gqa": True}, False),
+        ("b200_d64_direct_o", {"num_heads_kv": 8, "pack_gqa": False}, False),
+        ("b200_d64_direct_o", {"device_arch": 103}, False),
+        ("b200_d64_direct_o", {"head_dim": 128, "head_dim_v": 128}, False),
         ("sm103_d64_nonpersistent", {"max_seqlen_k": 4096}, True),
         ("sm103_d64_nonpersistent", {"max_seqlen_k": 3072}, False),
         ("sm103_d64_nonpersistent", {"head_dim": 96, "head_dim_v": 96}, False),
