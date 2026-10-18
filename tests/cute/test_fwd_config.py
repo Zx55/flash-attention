@@ -1,5 +1,5 @@
 import itertools
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 
@@ -35,8 +35,15 @@ def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInput
 
 
 @pytest.mark.parametrize("device_arch", [80, 90, 100, 103, 110, 120])
-def test_every_architecture_selects_a_valid_default(device_arch):
-    select_fwd_config(make_inputs(device_arch=device_arch))
+@pytest.mark.parametrize("causal", [False, True])
+def test_every_architecture_selects_a_valid_default(device_arch, causal):
+    config = select_fwd_config(make_inputs(device_arch=device_arch, causal=causal))
+    # Kernel compile-time flags must be concrete, not None.
+    for field in fields(config):
+        if field.name == "registers":
+            continue  # per-architecture record; validate_fwd_config checks its type
+        value = getattr(config, field.name)
+        assert type(value) is (bool if field.type in (bool, "bool") else int), field.name
 
 
 @pytest.mark.parametrize(
@@ -150,6 +157,7 @@ def test_clc_excludes_static_persistence():
     config = select_fwd_config(inputs)
 
     assert config.use_clc_scheduler
+    assert config.use_2cta_instrs
     assert not config.is_static_persistent
     with pytest.raises(ValueError, match="Static persistent scheduling"):
         validate_fwd_config(replace(config, is_static_persistent=True), inputs)
@@ -304,6 +312,46 @@ def test_sm90_flags_follow_tile_overrides_and_stay_sm90_only():
         validate_fwd_config(replace(config, mma_pv_is_rs=True), sm120)
 
 
+def test_dense_causal_clc_default_follows_the_measured_table():
+    inputs = make_inputs(device_arch=103, head_dim=128, head_dim_v=128, causal=True)
+
+    assert select_fwd_config(inputs).use_clc_scheduler
+    assert not select_fwd_config(inputs._replace(requested_use_clc_scheduler=False)).use_clc_scheduler
+    assert not select_fwd_config(inputs._replace(causal=False)).use_clc_scheduler
+    assert not select_fwd_config(inputs._replace(has_cu_seqlens_k=True)).use_clc_scheduler
+    assert not select_fwd_config(inputs._replace(device_arch=90)).use_clc_scheduler
+    # BF16 hd64 measured slower on SM103 but faster on SM100.
+    hd64 = inputs._replace(head_dim=64, head_dim_v=64)
+    assert not select_fwd_config(hd64).use_clc_scheduler
+    assert select_fwd_config(hd64._replace(device_arch=100)).use_clc_scheduler
+
+
+def test_causal_clc_cells_carry_their_register_split():
+    fp16_hd64 = make_inputs(device_arch=103, dtype="torch.float16", causal=True)
+    config = select_fwd_config(fp16_hd64)
+    # The default split spills once the kernel is persistent; the CLC cell names its own.
+    assert config.use_clc_scheduler
+    assert config.registers == Sm100Registers(softmax=184, correction=64, other=80)
+    no_clc = select_fwd_config(fp16_hd64._replace(requested_use_clc_scheduler=False))
+    assert not no_clc.use_clc_scheduler
+    assert no_clc.registers == Sm100Registers(softmax=200, correction=64, other=48)
+    # Forced CLC outside the measured dense causal class keeps the default split.
+    forced = fp16_hd64._replace(
+        requested_use_clc_scheduler=True, num_heads_kv=4, pack_gqa=True, has_cu_seqlens_k=True
+    )
+    config = select_fwd_config(forced)
+    assert config.use_clc_scheduler
+    assert config.registers == Sm100Registers(softmax=200, correction=64, other=48)
+    # B200 FP16 hd192 measured no better with a CLC split, so it keeps the default.
+    fp16_hd192 = make_inputs(device_arch=100, dtype="torch.float16", causal=True,
+                             head_dim=192, head_dim_v=128)
+    config = select_fwd_config(fp16_hd192)
+    assert config.use_clc_scheduler
+    assert config.registers == select_fwd_config(
+        fp16_hd192._replace(requested_use_clc_scheduler=False)
+    ).registers
+
+
 def test_hd256_uses_the_generic_sm100_contract():
     inputs = make_inputs(head_dim=256, head_dim_v=256, causal=True)
     config = select_fwd_config(inputs)
@@ -313,8 +361,17 @@ def test_hd256_uses_the_generic_sm100_contract():
     assert not config.use_clc_scheduler
     with pytest.raises(ValueError, match="TMEM"):
         validate_fwd_config(replace(config, q_stage=2), inputs)
+    # hd256 2CTA CLC supports dense, not varlen, cluster mapping.
+    validate_fwd_config(
+        replace(config, use_clc_scheduler=True, is_static_persistent=False), inputs
+    )
+    varlen = inputs._replace(has_cu_seqlens_q=True)
+    varlen_config = select_fwd_config(varlen)
+    assert varlen_config.use_2cta_instrs
     with pytest.raises(ValueError, match="CLC"):
-        validate_fwd_config(replace(config, use_clc_scheduler=True), inputs)
+        validate_fwd_config(
+            replace(varlen_config, use_clc_scheduler=True, is_static_persistent=False), varlen
+        )
     split = select_fwd_config(inputs._replace(requested_num_splits=2))
     assert (split.num_splits, split.use_tma_o, split.use_s_ping_pong) == (2, False, False)
 
@@ -396,7 +453,7 @@ def test_sm100_registers_match_the_legacy_kernel_policy(device_arch):
         inputs = make_inputs(device_arch=device_arch, dtype=dtype, head_dim=d, head_dim_v=d,
                              causal=causal, page_size=page)
         got = select_registers(inputs, tile_m=128, tile_n=128, q_stage=q_stage,
-                               use_2cta_instrs=use_2cta)
+                               num_splits=1, use_2cta_instrs=use_2cta, use_clc_scheduler=False)
         expected = legacy_sm100_registers(
             "float8" in dtype, inputs.head_dim_padded, causal, use_2cta, sm103,
             page not in (None, 128), q_stage,
@@ -410,7 +467,8 @@ def test_sm90_registers_match_the_legacy_kernel_policy():
     ):
         inputs = make_inputs(device_arch=90, num_heads=8 * qhead_per_kvhead, num_heads_kv=8,
                              pack_gqa=pack_gqa, page_size=page)
-        got = select_registers(inputs, tile_m=tile_m, tile_n=128, q_stage=1, use_2cta_instrs=False)
+        got = select_registers(inputs, tile_m=tile_m, tile_n=128, q_stage=1,
+                               num_splits=1, use_2cta_instrs=False, use_clc_scheduler=False)
         expected = legacy_sm90_registers(tile_m, pack_gqa, qhead_per_kvhead, page not in (None, 128))
         assert got == expected, (tile_m, pack_gqa, qhead_per_kvhead, page)
 

@@ -175,7 +175,7 @@ class TileSchedulerProtocol(Protocol):
         """Producer-side prefetch of next work tile (no-op for static schedulers).
 
         For dynamic schedulers: producer acquire (+ issue CLC query) + producer state advance.
-        Only called by the scheduler warp.
+        Called by the scheduler warp, or the load warp for late CLC claims.
         """
         ...
 
@@ -619,27 +619,28 @@ class SingleTileLPTScheduler:
     def clc_work_to_coords(self, work) -> WorkTileInfo:
         """Convert CLC response (block, head, batch_split) to WorkTileInfo.
 
-        CLC returns raw grid coordinates — no L2 swizzle (hardware decides order).
-        We only apply cluster division, optional LPT block reversal, and split_kv unpacking.
+        Unsplit 1CTA grids reuse the static L2-swizzled LPT mapping.
+        Clustered grids use one m block per cluster; num_block counts clusters.
         """
+        if const_expr(self.params.cluster_shape_m == 1 and not self.params.is_split_kv):
+            tile_idx = work.tile_idx[0] + self.params.num_block * (
+                work.tile_idx[1] + self.params.num_head * work.tile_idx[2]
+            )
+            return WorkTileInfo(self._static_coords(tile_idx).tile_idx, work.is_valid_tile)
+        assert not (self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx), (
+            "CLC with clusters requires use_cluster_idx"
+        )
         block_idx = work.tile_idx[0]
         if const_expr(self.params.cluster_shape_m > 1):
             block_idx = block_idx // self.params.cluster_shape_m
         if const_expr(self.params.lpt):
             # Longest-processing-time-first: reverse block order
-            if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-                num_block = self.params.num_block // self.params.cluster_shape_m
-            else:
-                num_block = self.params.num_block
-            block_idx = num_block - 1 - block_idx
+            block_idx = self.params.num_block - 1 - block_idx
         split_idx = Int32(0)
         if const_expr(self.params.is_split_kv):
             batch_idx, split_idx = divmod(work.tile_idx[2], self.params.num_splits_divmod)
         else:
             batch_idx = work.tile_idx[2]
-        if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-            bidx_in_cluster = cute.arch.block_in_cluster_idx()
-            block_idx = block_idx * self.params.cluster_shape_m + bidx_in_cluster[0]
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None):
             if work.is_valid_tile:
@@ -656,10 +657,14 @@ class SingleTileLPTScheduler:
             work = self._ctx.get_current_work()
             self._tile_idx = work.tile_idx[0]
             return self.clc_work_to_coords(work)
+        return self._static_coords(self._tile_idx)
+
+    @cute.jit
+    def _static_coords(self, tile_idx: Int32) -> WorkTileInfo:
         # Static path: L2-swizzled coordinate mapping
         params = self.params
         # Implement LPT scheduling coordinate calculation
-        bidhb, l2_mod = divmod(self._tile_idx, params.l2_major_divmod)
+        bidhb, l2_mod = divmod(tile_idx, params.l2_major_divmod)
         # If we're in the last section (called residual), we don't want to divide by
         # swizzle. Instead we want to divide by the remainder.
         block, bidhb_residual = 0, 0
@@ -672,7 +677,7 @@ class SingleTileLPTScheduler:
         # Longest-processing-time-first
         if const_expr(params.lpt):
             block = params.num_block - 1 - block
-        is_valid = self._tile_idx < params.total_blocks
+        is_valid = tile_idx < params.total_blocks
         split_idx = self._split_idx
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(params.is_split_kv and params.num_splits_dynamic_ptr is not None):

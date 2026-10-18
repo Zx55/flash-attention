@@ -98,6 +98,48 @@ def test_flash_attn_auto_splits_more_tiles_than_sms():
     assert torch.equal(out, ref)
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 CLC with 2CTA")
+# 900 gives 15 packed CTA tiles per KV head, leaving the last cluster half full.
+@pytest.mark.parametrize("seqlen_q", [1024, 900])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_clc_2cta_matches_default(monkeypatch, seqlen_q):
+    """CLC must assign both CTAs of a cluster the same m block."""
+    from flash_attn.cute import utils as cute_utils
+
+    torch.manual_seed(0)
+    # Varlen K allows CLC; dense Q keeps hd128 eligible for 2CTA.
+    lens_k = [1500, 2600]
+    q = torch.randn(2, seqlen_q, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu_seqlens_k = torch.tensor([0, lens_k[0], sum(lens_k)], device="cuda", dtype=torch.int32)
+    kwargs = dict(cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max(lens_k), pack_gqa=True)
+    ref = _flash_attn_fwd(q, k, v, **kwargs)[0]
+    monkeypatch.setattr(cute_utils, "_fa_clc_enabled", True)
+    selected = {}
+
+    def capture_config(inputs):
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture_config):
+        out = _flash_attn_fwd(q, k, v, **kwargs)[0]
+    assert selected["config"].use_clc_scheduler and selected["config"].use_2cta_instrs
+    # Dense Q and K run the non-varlen scheduler; force CLC on the default 2CTA config.
+    q_dense = q[:, :512].contiguous()
+    k_dense = torch.randn(2, 512, 16, 128, device="cuda", dtype=torch.bfloat16)
+    v_dense = torch.randn_like(k_dense)
+    with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture_config):
+        dense_ref = _flash_attn_fwd(q_dense, k_dense, v_dense)[0]
+    assert selected["config"].use_2cta_instrs
+    clc_config = replace(selected["config"], use_clc_scheduler=True, is_static_persistent=False)
+    dense_out = _flash_attn_fwd(q_dense, k_dense, v_dense, config=clc_config)[0]
+    if is_fake_mode():
+        return
+    assert torch.equal(out, ref)
+    assert torch.equal(dense_out, dense_ref)
+
+
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
 @pytest.mark.parametrize("num_splits", [0, -1])
 def test_flash_attn_sm120_num_splits(num_splits):

@@ -113,7 +113,7 @@ class FwdHeuristicInputs(NamedTuple):
     requested_mma_pv_is_rs: bool | None = None
     requested_intra_wg_overlap: bool | None = None
     requested_num_splits: int | None = None
-    requested_use_clc_scheduler: bool = False
+    requested_use_clc_scheduler: bool | None = None
     disable_2cta: bool = False
     disable_s_ping_pong: bool = False
 
@@ -359,13 +359,22 @@ def select_registers(
     tile_m: int,
     tile_n: int,
     q_stage: int,
+    num_splits: int,
     use_2cta_instrs: bool,
+    use_clc_scheduler: bool,
 ) -> Registers:
-    """Resolve the register split after the final tile, stage, and 2CTA choices."""
+    """Resolve the register split after the final tile, stage, 2CTA, and CLC choices."""
     match inputs.device_capacity:
         case 9:
             return select_sm90_registers(inputs, tile_m=tile_m, tile_n=tile_n)
         case 10 | 11:
+            # Persistent CLC keeps scheduler state live across tiles; see NOTE [causal CLC].
+            if (
+                use_clc_scheduler
+                and is_dense_causal_clc_problem(inputs, num_splits=num_splits, q_stage=q_stage)
+                and (clc_registers := causal_clc_registers(inputs))
+            ):
+                return clc_registers
             return select_sm100_registers(
                 inputs, tile_n=tile_n, q_stage=q_stage, use_2cta_instrs=use_2cta_instrs
             )
@@ -600,9 +609,66 @@ def can_use_clc(
         inputs.page_size in (None, tile_n)
         # A varlen-Q tile-count semaphore selects the dynamic persistent scheduler.
         and not (inputs.is_varlen_q and inputs.has_tile_count_semaphore)
-        # CLC does not map hd256 2CTA tiles correctly.
-        and not (inputs.is_hdim256 and use_2cta_instrs)
+        # Varlen CLC maps hd256 2CTA tiles per CTA, not per cluster.
+        and not (inputs.is_hdim256 and use_2cta_instrs and inputs.is_varlen)
     )
+
+
+# NOTE [causal CLC]
+# Measured dense causal CLC wins over nonpersistent LPT: <=0.5% loss per shape,
+# >1% gain on at least one shape, no extra spills. CLC preserves L2-swizzled LPT
+# order with late tile claims (clc_late_claim), amortizing CTA setup across tiles. Some
+# default splits spill once persistent; those cells carry the split to use under CLC.
+# (dtype path, head_dim_padded) -> {arch family: CLC register split, or None for the default}.
+_CAUSAL_CLC_DEFAULT = {
+    ("bf16", 64): {"sm_100": None},
+    ("bf16", 96): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("bf16", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("bf16", 192): {"sm_103": None},
+    ("fp16", 64): {"sm_103": Sm100Registers(softmax=184, correction=64, other=80)},
+    ("fp16", 96): {"sm_103": None, "sm_107": None},
+    ("fp16", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("fp16", 192): {"sm_100": None, "sm_103": None},
+    ("fp8", 64): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("fp8", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+}
+
+
+def _causal_clc_row(device_arch: int, dtype: str, head_dim: int) -> tuple[str, dict]:
+    """Return the arch family and its ``_CAUSAL_CLC_DEFAULT`` row (empty off SM10x)."""
+    major, minor = divmod(device_arch, 10)
+    if major != 10:
+        return "", {}
+    family = "sm_107" if minor >= 7 else "sm_103" if minor >= 3 else "sm_100"
+    path = "fp8" if "float8" in dtype else "fp16" if dtype == "torch.float16" else "bf16"
+    return family, _CAUSAL_CLC_DEFAULT.get((path, ceil_div(head_dim, 16) * 16), {})
+
+
+def causal_clc_default(device_arch: int, dtype: str, head_dim: int) -> bool:
+    """Dense causal CLC policy; see NOTE [causal CLC]."""
+    family, row = _causal_clc_row(device_arch, dtype, head_dim)
+    return family in row
+
+
+def is_dense_causal_clc_problem(inputs: FwdHeuristicInputs, *, num_splits: int, q_stage: int) -> bool:
+    """The problem class _CAUSAL_CLC_DEFAULT was measured on; see NOTE [causal CLC]."""
+    return (
+        inputs.causal
+        and not inputs.is_varlen
+        and not inputs.local
+        and num_splits == 1
+        and q_stage == 2
+        and inputs.page_size is None
+        and not inputs.use_block_sparsity
+        and not inputs.has_score_mod
+        and not inputs.has_mask_mod
+    )
+
+
+def causal_clc_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | None:
+    """Measured CLC register split for this cell, or None for the default split."""
+    family, row = _causal_clc_row(inputs.device_arch, inputs.dtype, inputs.head_dim)
+    return row.get(family)
 
 
 @lru_cache(maxsize=1024)
@@ -670,12 +736,18 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     # noncausal (work-stealing overhead).
     is_varlen_mha = inputs.is_varlen and inputs.qhead_per_kvhead == 1
     is_dense_noncausal = not inputs.is_varlen and not inputs.causal and not inputs.local
+    requested_clc = inputs.requested_use_clc_scheduler
+    default_clc = is_dense_causal_clc_problem(
+        inputs, num_splits=num_splits, q_stage=q_stage
+    ) and causal_clc_default(inputs.device_arch, inputs.dtype, inputs.head_dim)
     use_clc_scheduler = (
         is_sm100_family
         and can_use_clc(inputs, tile_n=tile_n, use_2cta_instrs=use_2cta_instrs)
-        and inputs.requested_use_clc_scheduler
-        and not is_varlen_mha
-        and not is_dense_noncausal
+        and requested_clc is not False
+        and (
+            default_clc
+            or (bool(requested_clc) and not is_varlen_mha and not is_dense_noncausal)
+        )
     )
     is_static_persistent = is_sm100_family and can_use_static_persistent(
         inputs,
@@ -719,7 +791,9 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             tile_m=tile_m,
             tile_n=tile_n,
             q_stage=q_stage,
+            num_splits=num_splits,
             use_2cta_instrs=use_2cta_instrs,
+            use_clc_scheduler=use_clc_scheduler,
         ),
     )
     validate_fwd_config(config, inputs)

@@ -13,7 +13,9 @@ from unittest import mock
 import pytest
 import torch
 
+from flash_attn.cute import interface as fa_interface
 from flash_attn.cute import utils as cute_utils
+from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 from flash_attn.cute.testing import attention_ref
@@ -285,6 +287,25 @@ class TestCLCHeadDim:
             f"Expected StaticPersistentTileScheduler fallback, got {sched_cls.__name__}"
         )
         assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC fallback, got {sched_mode!r}"
+
+
+class TestCLCDefault:
+    """FA_CLC=0 overrides the dense causal CLC default."""
+
+    @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="_CAUSAL_CLC_DEFAULT covers SM10x only")
+    @pytest.mark.parametrize("fa_clc", [None, False], ids=["unset", "off"])
+    def test_bf16_hd128_causal(self, fa_clc):
+        _captured_schedulers.clear()
+        # Cache hits bypass the scheduler spy.
+        with (
+            mock.patch.object(cute_utils, "_fa_clc_enabled", fa_clc),
+            mock.patch.object(fa_interface._flash_attn_fwd, "compile_cache", JITCache()),
+        ):
+            check_output(randn(2, 1024, 4, 128), randn(2, 1024, 4, 128), randn(2, 1024, 4, 128), causal=True, assert_clc=False)
+        assert _captured_schedulers, "No scheduler was captured"
+        sched_cls, sched_mode, _ = _captured_schedulers[-1]
+        assert sched_cls is SingleTileLPTScheduler, sched_cls.__name__
+        assert sched_mode == (SchedulingMode.CLC if fa_clc is None else SchedulingMode.STATIC), sched_mode
 
 
 class TestCLCFallback:
@@ -623,7 +644,7 @@ class TestCLCRepeatability:
         check_output(randn(5, 128, 8, 128), randn(5, 1024, 2, 128), randn(5, 1024, 2, 128))
 
 class TestCLCHd256:
-    """CLC does not map hd256 2CTA tiles; the forward must fall back to non-CLC 2CTA."""
+    """hd256 2CTA supports CLC with dense Q, but not varlen Q."""
 
     @staticmethod
     def assert_2cta_without_clc():
@@ -634,22 +655,43 @@ class TestCLCHd256:
         assert sched_mode != SchedulingMode.CLC, f"Expected CLC disabled for hd256 2CTA, got {sched_mode!r}"
 
     @pytest.mark.parametrize("sq,sk,q_heads,kv_heads", [
+        # Partial clusters must round up the LPT block count.
         (1, 4096, 4, 1),  # decode: single M block
+        (384, 384, 1, 1),
         (256, 256, 1, 1),
-        (384, 384, 1, 1),  # odd number of M tiles
         (512, 512, 1, 1),
     ])
     def test_causal(self, sq, sk, q_heads, kv_heads):
         check_output(
             randn(1, sq, q_heads, 256), randn(1, sk, kv_heads, 256), randn(1, sk, kv_heads, 256),
-            causal=True, assert_clc=False,
+            causal=True, assert_2cta=True,
         )
-        self.assert_2cta_without_clc()
 
     @pytest.mark.parametrize("causal", [False, True])
     def test_varlen_gqa(self, causal):
         check_varlen_output([300, 129, 257, 64], heads=12, d=256, kv_heads=2, causal=causal, assert_sched=False)
         self.assert_2cta_without_clc()
+
+
+class TestCLC2CTASequsedK:
+    """seqused_k permits CLC for noncausal GQA; dense Q keeps 2CTA eligible."""
+
+    @pytest.mark.parametrize("sq,seqlens_k", [(384, [384, 200]), (512, [1000, 129, 64])])
+    def test_noncausal_gqa(self, sq, seqlens_k):
+        batch, max_sk = len(seqlens_k), max(seqlens_k)
+        seqused_k = torch.tensor(seqlens_k, device="cuda", dtype=torch.int32)
+        q, k, v = randn(batch, sq, 8, 128), randn(batch, max_sk, 2, 128), randn(batch, max_sk, 2, 128)
+        _captured_schedulers.clear()
+        out, _ = flash_attn_varlen_func(q, k, v, seqused_k=seqused_k)
+        torch.cuda.synchronize()
+        if _captured_schedulers:
+            _, sched_mode, use_2cta = _captured_schedulers[-1]
+            assert use_2cta and sched_mode == SchedulingMode.CLC, (use_2cta, sched_mode)
+        k_mask = torch.arange(max_sk, device="cuda")[None, :] < seqused_k[:, None]
+        out_ref, _ = attention_ref(q, k, v, key_padding_mask=k_mask)
+        out_pt, _ = attention_ref(q, k, v, key_padding_mask=k_mask, upcast=False, reorder_ops=True)
+        fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
 
 
 if __name__ == "__main__":
